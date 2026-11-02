@@ -1,0 +1,235 @@
+clear
+close all
+reset(gpuDevice)
+
+% SUPER IMPORTANT FOR THE FINAL IMAGE IS HOW MANY EVALUATIONS OF THE CHAOS METRIC ALONG THE TRAJECTORY ARE SUMMED UP FOR THE FINAL METRIC. USE ONLY THE FINAL STATE TO HAVE MORE SHARP FEATURES!!! 
+% IF YOU SUM UP DIFFERENCES SAMPLED FROM THE WHOLE TRAJECTORY YOU WILL SMEAR OUT SOME EFFECTS SINCE IN THE BEGINNING ALOT OF POSITONS ARE MORE STABLE THAN LATER ON
+
+% Simulation set-up
+T = 10; % [s] 
+dt = 0.01; % [s] RK4 step size
+Nt = ceil(T/dt);
+eps = 1e-5; % perturbation strength
+
+% Pendulum design
+m1 = 1;  % [kg]
+m2 = 1;  % [kg]
+L1 = 1;  % [m]
+L2 = 1;  % [m]
+g = 10;  % [m/s^2]
+param = [m1;L1;m2;L2;g];
+
+%%% Define grid resolution
+n = 2501; % must be an ODD number when used with render mode 'symmetry' so there will be a center line.
+
+hyperparam_str = ['_T_',num2str(T),'_dt_',num2str(dt),'_eps_',num2str(eps, '%.0e'),'_m1m2_',num2str(m1),'_L1L2_',num2str(L1),'_n_',num2str(n),'_GPU_RK4']
+
+% Chose render mode
+render_mode = 'symmetry'; % 'symmetry' or 'free_zoom'
+switch render_mode
+    case 'symmetry'
+        n_half = ceil(n/2); % we will simulate only on half of the first angle range since the other half is the same
+        alpha_lb =  0 * pi/180; 
+        alpha_ub =  180 * pi/180;
+        beta_lb = -180 * pi/180;
+        beta_ub =  180 * pi/180;
+        alpha_span = linspace(alpha_lb, alpha_ub, n_half);
+        beta_span  = linspace(beta_lb, beta_ub, n);
+        Deviation_flat = zeros(1, n*n_half);   % Pre-allocate output vector
+    case 'free_zoom'
+        alpha_lb = 162  * pi/180;
+        alpha_ub = 173  * pi/180;
+        beta_lb =  -28 * pi/180;
+        beta_ub =  -10  * pi/180;
+        alpha_span = linspace(alpha_lb, alpha_ub, n);
+        beta_span = linspace(beta_lb, beta_ub, n);
+        Deviation_flat = zeros(1, n^2);   % Pre-allocate output vector
+end
+
+
+[A, B] = meshgrid(alpha_span, beta_span);
+% Flatten and transpose the grid before adding the perturbation
+alpha_pos = A(:).' + eps;
+alpha_neg = A(:).' - eps;
+beta_pos  = B(:).' + eps;
+beta_neg  = B(:).' - eps;
+
+Np = numel(alpha_pos); % Number double pendulums simulated in parallel
+
+% Create matrices of intial condition. Each column represents the state of a double pendulum
+X0_pos = [alpha_pos;
+          beta_pos;
+          zeros(1,Np);
+          zeros(1,Np)];
+
+X0_neg = [alpha_neg;
+          beta_neg;
+          zeros(1,Np);
+          zeros(1,Np)];
+
+%%% Move the necessary variables to the GPU
+tic
+% param = gpuArray(param); % oddly the whole thing runs almost twice as fast if we DO NOT pass the parameters to the GPU
+X_pos = gpuArray(X0_pos);
+X_neg = gpuArray(X0_neg);
+Deviation_flat = gpuArray(Deviation_flat);
+
+EMA_memoryloss_factor = 0.5;
+EMA_memoryretain_factor = 1-EMA_memoryloss_factor;
+% Perform Runge-Kutta 4 integration on the GPU
+for k = 1:Nt
+    % Integrate positive perturbation
+    K1 = pendulum_double_angle_minTrig_rhs(X_pos, param);
+    K2 = pendulum_double_angle_minTrig_rhs(X_pos + 0.5.*dt.*K1, param);
+    K3 = pendulum_double_angle_minTrig_rhs(X_pos + 0.5.*dt.*K2, param);
+    K4 = pendulum_double_angle_minTrig_rhs(X_pos + dt.*K3, param);
+    X_pos = X_pos + dt./6 .* (K1 + 2.*K2 + 2.*K3 + K4);
+
+    % Integrate negative perturbation
+    K1 = pendulum_double_angle_minTrig_rhs(X_neg, param);
+    K2 = pendulum_double_angle_minTrig_rhs(X_neg + 0.5.*dt.*K1, param);
+    K3 = pendulum_double_angle_minTrig_rhs(X_neg + 0.5.*dt.*K2, param);
+    K4 = pendulum_double_angle_minTrig_rhs(X_neg + dt.*K3, param);
+    X_neg = X_neg + dt./6 .* (K1 + 2.*K2 + 2.*K3 + K4);
+
+    % Compute Deviation at time step k
+    Delta_k = X_pos - X_neg; % 1 x n^2 for square grids
+    
+    % Accumulate distance metric
+    % Deviation_flat = Deviation_flat + sqrt(sum(Delta_k.^2)); % compute the norm of each state vector and add to the previous
+    Deviation_flat = EMA_memoryloss_factor.*Deviation_flat + EMA_memoryretain_factor.*sqrt(sum(Delta_k.^2)); % compute the norm of each state vector and add to the previous
+
+end
+
+% Fetch data from GPU
+Deviation_flat = gather(Deviation_flat);
+
+% X_pos = gather(X_pos);
+% X_neg = gather(X_neg);
+% Deviation_flat = sqrt(sum((X_pos(1:2,:) - X_neg(1:2,:)).^2)); % Position only
+% Deviation_flat = sqrt(sum((X_pos(3:4,:) - X_neg(3:4,:)).^2)); % Velocity only
+% Deviation_flat = sqrt(sum((X_pos - X_neg).^2)); % Both states of both 
+
+% Reshape to form the correct image
+switch render_mode
+    case 'symmetry'
+        Deviation_HalfMat = reshape(Deviation_flat, n, n_half);
+        Deviation_Mat = [flip(flip(Deviation_HalfMat(:,2:end),1),2),Deviation_HalfMat];
+        % Measure elapsed time
+        GPU_total_time_symetry = toc
+        GPU_Gridpoint_time_ms = GPU_total_time_symetry/(n*n_half) * 1000
+        alpha_span = linspace(-pi/1, alpha_ub, n);
+    case 'free_zoom'
+        Deviation_Mat = reshape(Deviation_flat, n, n);
+        % Measure elapsed time
+        n
+        GPU_total_time_free_zoom = toc
+        GPU_Gridpoint_time_ms = GPU_total_time_free_zoom/(n^2) * 1000
+end
+
+
+%%% Prepare the plots
+fig = figure('Position', [200, 100, 1200, 1200], 'Color', 'k','Name', 'Double Pendulum Fractal'); % For the dynamcis
+ax = axes(fig, 'Position', [0.08, 0.08, 0.88, 0.88]);
+title(['T=',num2str(T),'  dt=',num2str(dt),'  eps=',num2str(eps, '%.0e'),'  m1m2=',num2str(m1),'  L1L2=',num2str(L1),'  n=',num2str(n),'  GPU-RK4'], 'Color', 'w')
+% Convert radians to degrees
+alpha_span = alpha_span .* 180./pi;
+beta_span = beta_span .* 180./pi;
+[A, B] = meshgrid(alpha_span, beta_span);
+
+% Plot
+surf(A, B, log(Deviation_Mat), 'EdgeAlpha', 0)
+
+xlabel('$\alpha_0 \; [^{\circ}]$', 'FontSize', 20, 'Color', 'w')
+ylabel('$\beta_0 \;  [^{\circ}]$', 'FontSize', 20, 'Color', 'w')
+
+xlim([alpha_span(1), alpha_span(end)])
+ylim([beta_span(1), beta_span(end)])
+
+%%% Apply the magic
+% colormap(inferno)
+% colormap(magma)
+% colormap(viridis)
+% colormap(twilight_shifted)
+% colormap(hot)
+% colormap(flip(hot))
+
+colormap((slanCM('seasons')))
+% colormap(flip(slanCM('gist_heat')))
+
+% colormap(flip(slanCM('fusion')))
+% colormap((slanCM('tokyo')))
+% colormap(slanCM('pride'))
+% colormap((slanCM('copper2')))
+% colormap((slanCM('emergency')))
+% colormap(flip(slanCM('gist_ncar')))
+% colormap(flip(slanCM('gnuplot')))
+
+% hold on
+% plot3([-pi,pi],[0,0],[10,10],'r-')
+% plot3([0,0],[-pi,pi],[10,10],'r-')
+
+grid off
+ax.Color = 'k';
+ax.XAxis.Color = 'w';
+ax.YAxis.Color = 'w';
+ax.ZAxis.Color = 'w';
+
+ax.XAxis.FontSize = 14;
+ax.YAxis.FontSize = 14;
+ax.ZAxis.FontSize = 14;
+
+ax.View = [0,90];
+% ax.Position = [0, 0, 1, 1];
+% ax.XTicks = []; 
+% ax.YTicks = [];
+
+set(findall(fig,'-property','Box'),'Box','off') % optional
+set(findall(fig,'-property','Interpreter'),'Interpreter','latex') 
+set(findall(fig,'-property','TickLabelInterpreter'),'TickLabelInterpreter','latex')
+% set(fig,'Units','centimeters','Position',[3 3 picturewidth hw_ratio*picturewidth])
+% pos = get(fig,'Position');
+% set(fig,'PaperPositionMode','Auto','PaperUnits','centimeters','PaperSize',[pos(3), pos(4)])
+%print(hfig,fname,'-dpdf','-painters','-fillpage')
+% print(hfig,fname,'-dpng','-painters')
+
+
+
+
+
+
+% % Plot as image
+% fig = figure('Position', [1000, 100, 1200, 1200], 'Name', 'Double Pendulum Fractal'); % For the dynamcis
+% ax = axes(fig, 'Position', [0.08, 0.08, 0.88, 0.88]);
+% 
+% % Flip and normalize
+% Deviation_Mat_fliped_log = flip(log(Deviation_Mat));
+% Deviation_Mat_normalized = (Deviation_Mat_fliped_log - min(Deviation_Mat_fliped_log,[],'all'))./(max(Deviation_Mat_fliped_log,[],'all') - min(Deviation_Mat_fliped_log,[],'all'));
+
+% imagesc(Deviation_Mat_normalized)
+% colormap((slanCM('seasons')))
+
+
+
+
+
+
+
+% %%% SVD Plots
+% fig = figure('Position', [600, 100, 1200, 1200], 'Color', 'k','Name', 'Double Pendulum Fractal'); % For the dynamcis
+% ay = axes(fig, 'Position', [0.08, 0.08, 0.88, 0.88]);
+% 
+% [U,S,V] = svd(log(Deviation_Mat));
+% 
+% suf = surf(ay, A1, A2, U(:,1:1)*S(1:1,1:1)*V(:,1:1)', 'EdgeAlpha', 0);
+% colormap(ay, (slanCM('seasons')))
+% ay.View = [0,90];
+% 
+% pause(1)
+% for i = 1:50
+% 
+%     lowREs = U(:,1:i)*S(1:i,1:i)*V(:,1:i)';
+% 
+%     suf.ZData = lowREs;
+%     pause(1/10)
+% end
